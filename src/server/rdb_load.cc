@@ -188,7 +188,7 @@ string ModuleTypeName(uint64_t module_id) {
 bool RdbTypeAllowedEmpty(int type) {
   return type == RDB_TYPE_STRING || type == RDB_TYPE_JSON || type == RDB_TYPE_SBF ||
          type == RDB_TYPE_STREAM_LISTPACKS || type == RDB_TYPE_SET_WITH_EXPIRY ||
-         type == RDB_TYPE_HASH_WITH_EXPIRY;
+         type == RDB_TYPE_HASH_WITH_EXPIRY || type == RDB_TYPE_SBF2;
 }
 
 DbSlice& GetCurrentDbSlice() {
@@ -1316,6 +1316,9 @@ error_code RdbLoaderBase::ReadObj(int rdbtype, OpaqueObj* dest) {
     case RDB_TYPE_SBF:
       iores = ReadSBF();
       break;
+    case RDB_TYPE_SBF2:
+      iores = ReadSBF2();
+      break;
     default:
       LOG(ERROR) << "Unsupported rdb type " << rdbtype;
 
@@ -1851,7 +1854,7 @@ auto RdbLoaderBase::ReadRedisJson() -> io::Result<OpaqueObj> {
   return OpaqueObj{std::move(dest), RDB_TYPE_JSON};
 }
 
-auto RdbLoaderBase::ReadSBF() -> io::Result<OpaqueObj> {
+auto RdbLoaderBase::ReadSBFImpl(bool chunking) -> io::Result<OpaqueObj> {
   RdbSBF res;
   uint64_t options;
   SET_OR_UNEXPECT(LoadLen(nullptr), options);
@@ -1874,7 +1877,27 @@ auto RdbLoaderBase::ReadSBF() -> io::Result<OpaqueObj> {
     unsigned hash_cnt;
     string filter_data;
     SET_OR_UNEXPECT(LoadLen(nullptr), hash_cnt);
-    SET_OR_UNEXPECT(FetchGenericString(), filter_data);
+
+    if (chunking) {
+      unsigned total_size = 0;
+      SET_OR_UNEXPECT(LoadLen(nullptr), total_size);
+
+      filter_data.resize(total_size);
+      size_t offset = 0;
+      while (offset < total_size) {
+        unsigned chunk_size = 0;
+        SET_OR_UNEXPECT(LoadLen(nullptr), chunk_size);
+        error_code ec = FetchBuf(chunk_size, filter_data.data() + offset);
+        if (ec) {
+          return make_unexpected(ec);
+        }
+
+        offset += chunk_size;
+      }
+    } else {
+      SET_OR_UNEXPECT(FetchGenericString(), filter_data);
+    }
+
     size_t bit_len = filter_data.size() * 8;
     if (!is_power2(bit_len)) {  // must be power of two
       return Unexpected(errc::rdb_file_corrupted);
@@ -1882,6 +1905,14 @@ auto RdbLoaderBase::ReadSBF() -> io::Result<OpaqueObj> {
     res.filters.emplace_back(hash_cnt, std::move(filter_data));
   }
   return OpaqueObj{std::move(res), RDB_TYPE_SBF};
+}
+
+auto RdbLoaderBase::ReadSBF() -> io::Result<OpaqueObj> {
+  return ReadSBFImpl(false);
+}
+
+auto RdbLoaderBase::ReadSBF2() -> io::Result<OpaqueObj> {
+  return ReadSBFImpl(true);
 }
 
 template <typename T> io::Result<T> RdbLoaderBase::FetchInt() {
@@ -2568,12 +2599,10 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
                         item->val.rdb_type);
   };
 
-  // Streamed big values are stored in a separate map. unique_ptr for pointer stability
-  thread_local std::unordered_map<std::string, std::unique_ptr<PrimeValue>> now_streamed;
   LoadConfig config_copy = item->load_config;
   if (item->load_config.streamed && item->load_config.append) {
-    if (auto it = now_streamed.find(item->key); it != now_streamed.end()) {
-      pv_ptr = &*now_streamed[item->key];
+    if (auto it = now_streamed_.find(item->key); it != now_streamed_.end()) {
+      pv_ptr = &*now_streamed_[item->key];
     } else {
       // Sets and hashes are deleted when all their entries are expired.
       // If it's the case, set reset append flag and start from scratch.
@@ -2606,18 +2635,18 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     }
     LOG(ERROR) << "Could not load value for key '" << item->key << "' in DB " << db_ind;
     stop_early_ = true;
-    now_streamed.clear();
+    now_streamed_.clear();
     return;
   }
 
   if (item->load_config.streamed) {
-    if (now_streamed.find(item->key) == now_streamed.end())
-      now_streamed.emplace(item->key, make_unique<PrimeValue>(std::move(pv)));
+    if (now_streamed_.find(item->key) == now_streamed_.end())
+      now_streamed_.emplace(item->key, make_unique<PrimeValue>(std::move(pv)));
 
     if (!item->load_config.finalize)
       return;
 
-    pv = std::move(*now_streamed.extract(item->key).mapped());
+    pv = std::move(*now_streamed_.extract(item->key).mapped());
   }
 
   // We need this extra check because we don't return empty_key
@@ -2647,7 +2676,8 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
   }
 
   if (!override_existing_keys_ && !res.is_new) {
-    LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind;
+    LOG(WARNING) << "RDB has duplicated key '" << item->key << "' in DB " << db_ind << " of type "
+                 << res.it->second.ObjType();
   }
 
   if (auto* ts = db_slice->shard_owner()->tiered_storage(); ts) {
